@@ -292,6 +292,12 @@ PLASMA_LINKOPTS = [] + select({
     ],
 })
 
+CXX_LINKOPTS = select({
+    "//conditions:default": [
+        "-lstdc++fs",
+    ],
+})
+
 cc_library(
     name = "plasma_client",
     srcs = [
@@ -477,6 +483,7 @@ cc_binary(
     name = "raylet",
     srcs = ["src/ray/raylet/main.cc"],
     copts = COPTS,
+    linkopts = CXX_LINKOPTS,
     visibility = ["//java:__subpackages__"],
     deps = [
         ":ray_util",
@@ -563,6 +570,7 @@ cc_binary(
         "src/ray/gcs/gcs_server/gcs_server_main.cc",
     ],
     copts = COPTS,
+    linkopts = CXX_LINKOPTS,
     visibility = ["//java:__subpackages__"],
     deps = [
         ":gcs_server_lib",

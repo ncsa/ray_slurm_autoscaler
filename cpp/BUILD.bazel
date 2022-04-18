@@ -3,6 +3,12 @@
 
 load("//bazel:ray.bzl", "COPTS")
 
+CXX_LINKOPTS = select({
+    "//conditions:default": [
+        "-lstdc++fs",
+    ],
+})
+
 cc_binary(
     name = "libray_api.so",
     copts = COPTS,
@@ -63,6 +69,7 @@ cc_binary(
         "src/ray/worker/default_worker.cc",
     ]),
     copts = COPTS,
+    linkopts = CXX_LINKOPTS,
     linkstatic = True,
     deps = [
         "ray_api",
