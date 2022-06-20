@@ -16,10 +16,14 @@ upscaling_speed: 1.0
 idle_timeout_minutes: 5
 
 provider:
-    type: external
-    module: ray.autoscaler._private.slurm.node_provider.NodeProvider
-    temp_folder_name: temp_script
-    template_path: /home/tingkai2/anaconda3/envs/ray-py3.7/lib/python3.7/site-packages/ray/autoscaler/_private/slurm/template/
+  type: external
+  module: ray.autoscaler._private.slurm.node_provider.NodeProvider
+  temp_folder_name: temp_script
+  template_path: /home/tingkai2/anaconda3/envs/ray-py3.7/lib/python3.7/site-packages/ray/autoscaler/_private/slurm/template/
+  head_ip: "192.168.1.1" 
+  gcs_port: "6379"
+  ray_client_port: "5000"
+  dashboad_port : "8265"
 
 # Specify the type for the ray head node (as configured below).
 head_node_type: head_node
@@ -40,12 +44,8 @@ available_node_types:
     resources: {"CPU": 1, "GPU": 0, "HPC": 1} # will be used by autoscaler scheduler
     node_config:
       head_node: 1 # needed by my create node 
-      under_slurm: 0 # whether the head node should be started under slurm
+      under_slurm: 1 # whether the head node should be started under slurm
       head_node_name : "kfcompute1" # only useful when launching head under slurm
-      head_ip: "192.168.1.1" 
-      gcs_port: "6379"
-      ray_client_port: "10001"
-      dashboad_port : "8265"
       init_commands:
         - conda activate ray-py3.7
   

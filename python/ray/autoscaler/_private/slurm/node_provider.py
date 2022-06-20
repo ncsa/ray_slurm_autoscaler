@@ -1,3 +1,4 @@
+import json
 import logging
 from types import ModuleType
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,9 @@ from ray.autoscaler._private.slurm.slurm_commands import (
     slurm_launch_worker,
     slurm_get_node_name
 )
+
+from threading import RLock
+from filelock import FileLock
 
 from ray.autoscaler._private.cli_logger import cli_logger
 
@@ -28,14 +32,11 @@ node id: the slurm batch submission id for the node
 node ip: the node name in slurm
 
 Information needed for each node:
-1. Slurm job id
+1. Slurm job id (major key)
 2. State: running, pending, terminated (should just be deleted)
     Currently only have running state
 3. Tag (set and read by updator)
 4. IP (Slurm node name)
-
-# TODO: Lock?
-# FIXME: It seems like node_provider is not presistant. Should store node info to local file
 
 '''
 
@@ -51,10 +52,76 @@ HEAD_UNDER_SLURM = False
 WORKER_UNDER_SLURM = True
 DEFAULT_TEMP_FOLDER_NAME = "temp_script"
 
-# Indices for node info
-INFO_STATE_INDEX = 0
-INFO_TAG_INDEX = 1
-INFO_IP_INDEX = 2
+filelock_logger = logging.getLogger("filelock")
+filelock_logger.setLevel(logging.WARNING)
+
+# Keep the file operations from local.ClusterState
+class SlurmClusterState:
+    def __init__(self, lock_path, save_path, provider_config):
+        self.lock = RLock()
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        self.file_lock = FileLock(lock_path)
+        self.save_path = save_path
+
+        with self.lock:
+            with self.file_lock:
+                if os.path.exists(self.save_path): # Reload the cluser states
+                    workers = json.loads(open(self.save_path).read())
+                    
+                    # TODO: Can check each job id to see whether it is still running
+                    # head_config = workers.get(provider_config["head_ip"])
+                    # if (
+                    #     not head_config
+                    #     or head_config.get("tags", {}).get(TAG_RAY_NODE_KIND)
+                    #     != NODE_KIND_HEAD
+                    # ):
+                    #     workers = {}
+                    #     logger.info("Head IP changed - recreating cluster.")
+                else:
+                    workers = {}
+                    with open(self.save_path, "w") as f:
+                        logger.debug(
+                            "ClusterState: Writing cluster state: {}".format(workers)
+                        )
+                        f.write(json.dumps(workers))
+
+                logger.info(
+                    "ClusterState: Loaded cluster state: {}".format(list(workers))
+                )
+
+    def get(self):
+        with self.lock:
+            with self.file_lock:
+                workers = json.loads(open(self.save_path).read())
+                return workers
+
+    def put(self, worker_id, info):
+        assert "tags" in info
+        assert "state" in info
+        with self.lock:
+            with self.file_lock:
+                workers = self.get()
+                workers[worker_id] = info
+                with open(self.save_path, "w") as f:
+                    logger.info(
+                        "ClusterState: "
+                        "Writing cluster state: {}".format(list(workers))
+                    )
+                    f.write(json.dumps(workers))
+    
+    def delete(self, worker_id: str):
+        with self.lock:
+            with self.file_lock:
+                workers = self.get()
+                if worker_id in workers:
+                    workers.pop(worker_id)
+                with open(self.save_path, "w") as f:
+                    logger.info(
+                        "ClusterState: "
+                        "Writing cluster state: {}".format(list(workers))
+                    )
+                    f.write(json.dumps(workers))
+
 
 class NodeProvider:
     """Interface for getting and returning nodes from a Cloud.
@@ -79,27 +146,33 @@ class NodeProvider:
         self.provider_config = provider_config
         self.cluster_name = cluster_name
         self._internal_ip_cache: Dict[str, str] = {} # node ip : node id
-        # self._external_ip_cache: Dict[str, str] = {}
+        self._external_ip_cache: Dict[str, str] = {} # should not be used
 
         # Create a folder to store modified scripts
         temp_folder_name = DEFAULT_TEMP_FOLDER_NAME
         if "temp_folder_name" in provider_config:
             temp_folder_name = provider_config["temp_folder_name"]
-        if os.path.exists(temp_folder_name+"/"):
-            os.system("rm -rf " + temp_folder_name)
-        os.mkdir(temp_folder_name)
         
+        os.makedirs(temp_folder_name, exist_ok=True)
+
         self.temp_folder = temp_folder_name
         self.template_folder = provider_config["template_path"]
 
         self.head_started = False
-        self.head_ip = ""
-        self.gcs_port = ""
-        self.ray_client_port = ""
-        self.dashboard_port = ""
+        self.head_ip = provider_config["head_ip"]
+        self.gcs_port = provider_config["gcs_port"]
+        self.ray_client_port = provider_config["ray_client_port"]
+        self.dashboard_port = provider_config["dashboad_port"]
 
-        # The insertion order for keys are maintained, so node[0] is still head
-        self.lauched_nodes = {} # node_id : [state, tag, ip]
+        lock_path = os.path.join(self.temp_folder,
+                        "cluster-{}.lock".format(cluster_name))
+        state_path = os.path.join(self.temp_folder,
+                        "cluster-{}.state".format(cluster_name))
+        self.state = SlurmClusterState(
+            lock_path,
+            state_path,
+            provider_config,
+        )
 
 
     def is_readonly(self) -> bool:
@@ -127,33 +200,45 @@ class NodeProvider:
             ["node-1", "node-2"]
 
         """
-        ret = []
-        for node, value in self.lauched_nodes.items():
+        workers = self.state.get()
+        matching_ips = []
+        for worker_ip, info in workers.items():
+            if info["state"] == SLURM_STATE_TERMINATED: # Redundant for now: terminated nodes are deleted
+                continue
+
             ok = True
             for k, v in tag_filters.items():
-                if value[INFO_TAG_INDEX].get(k) != v:
+                if info["tags"].get(k) != v:
                     ok = False
                     break
+
             if ok:
-                ret.append(node)
-        return ret
+                matching_ips.append(worker_ip)
+
+        return matching_ips
 
     def is_running(self, node_id: str) -> bool:
         """Return whether the specified node is running."""
-        if node_id in self.lauched_nodes:
-            return self.lauched_nodes[node_id][INFO_STATE_INDEX] == SLURM_STATE_RUNNING
+
+        workers = self.state.get()
+        
+        if node_id in workers:
+            return workers[node_id]["state"] == SLURM_STATE_RUNNING
         else:
             cli_logger.warning("Get is_running for non-existing node\n")
             return False
 
     def is_terminated(self, node_id: str) -> bool:
         """Return whether the specified node is terminated."""
-        return node_id not in self.lauched_nodes
+        workers = self.state.get()
+        return node_id not in workers
 
     def node_tags(self, node_id: str) -> Dict[str, str]:
         """Returns the tags of the given node (string dict)."""
-        if node_id in self.lauched_nodes:
-            return self.lauched_nodes[node_id][INFO_TAG_INDEX]
+
+        workers = self.state.get()
+        if node_id in workers:
+            return workers[node_id]["tags"]
         else:
             cli_logger.warning("Get tags for non-existing node\n")
             return {}
@@ -164,9 +249,9 @@ class NodeProvider:
 
     def internal_ip(self, node_id: str) -> str:
         """Returns the internal ip (Ray ip) of the given node."""
-        
-        if node_id in self.lauched_nodes:
-            return self.lauched_nodes[node_id][INFO_IP_INDEX]
+        workers = self.state.get()
+        if node_id in workers:
+            return workers[node_id]["ip"]
         else:
             cli_logger.warning("Get internal ip for non-existing node\n")
             return {}
@@ -187,11 +272,33 @@ class NodeProvider:
 
         if not use_internal_ip:
             raise ValueError("Must use internal IPs with slurm")
-        
-        # Should success
-        return self._internal_ip_cache[ip_address]
 
-    def create_node( # TODO: add tags & counts
+        def find_node_id():
+            if use_internal_ip:
+                return self._internal_ip_cache.get(ip_address)
+            else:
+                return self._external_ip_cache.get(ip_address)
+
+        if not find_node_id(): # can be optimized...the file is read multiple times
+            all_nodes = self.non_terminated_nodes({})
+            ip_func = self.internal_ip if use_internal_ip else self.external_ip
+            ip_cache = (
+                self._internal_ip_cache if use_internal_ip else self._external_ip_cache
+            )
+            for node_id in all_nodes:
+                ip_cache[ip_func(node_id)] = node_id
+
+        if not find_node_id():
+            if use_internal_ip:
+                known_msg = f"Worker internal IPs: {list(self._internal_ip_cache)}"
+            else:
+                known_msg = f"Worker external IP: {list(self._external_ip_cache)}"
+            raise ValueError(f"ip {ip_address} not found. " + known_msg)
+
+        return find_node_id()
+        
+
+    def create_node( 
         self, node_config: Dict[str, Any], tags: Dict[str, str], count: int
     ) -> Optional[Dict[str, Any]]:
         """Creates a number of nodes within the namespace.
@@ -228,13 +335,18 @@ class NodeProvider:
                     self.template_folder,
                     self.temp_folder, 
                     current_conf["head_node_name"], 
-                    current_conf["gcs_port"],
-                    current_conf["ray_client_port"],
-                    current_conf["dashboad_port"],
+                    self.gcs_port,
+                    self.ray_client_port,
+                    self.dashboard_port,
                     parsed_init_command
                 )
                 node_name = slurm_get_node_name(node_id)
-                self.lauched_nodes[node_id] = [SLURM_STATE_RUNNING, tags, node_name]
+                node_info = {}
+                node_info["state"] = SLURM_STATE_RUNNING
+                node_info["tags"] = tags
+                node_info["ip"] = node_name
+                self.state.put(node_id, node_info)
+
                 self._internal_ip_cache[node_name] = node_id
             else:
                 for _ in range(count):
@@ -245,7 +357,12 @@ class NodeProvider:
                         parsed_init_command
                     )
                     node_name = slurm_get_node_name(node_id)
-                    self.lauched_nodes[node_id] = [SLURM_STATE_RUNNING, tags, node_name]
+                    node_info = {}
+                    node_info["state"] = SLURM_STATE_RUNNING
+                    node_info["tags"] = tags
+                    node_info["ip"] = node_name
+                    self.state.put(node_id, node_info)
+
                     self._internal_ip_cache[node_name] = node_id
 
         else:
@@ -254,23 +371,23 @@ class NodeProvider:
                 for init in current_conf["init_commands"]:
                     command += init + " && "
                 command += "ray start --head"
-                command += " --port=" + current_conf["gcs_port"]
-                command += " --ray-client-server-port=" + current_conf["ray_client_port"]
-                command += " --dashboard-port=" + current_conf["dashboad_port"]
+                command += " --port=" + self.gcs_port
+                command += " --ray-client-server-port=" + self.ray_client_port
+                command += " --dashboard-port=" + self.dashboard_port
                 command += " --num-cpus=0 --num-gpus=0"
                 os.system(command)
-                self.lauched_nodes[HEAD_NODE_ID_OUTSIDE_SLURM] = [SLURM_STATE_RUNNING, tags, current_conf["head_ip"]]
-                self._internal_ip_cache[current_conf["head_ip"]] = HEAD_NODE_ID_OUTSIDE_SLURM
+
+                node_info = {}
+                node_info["state"] = SLURM_STATE_RUNNING
+                node_info["tags"] = tags
+                node_info["ip"] = self.head_ip
+                self.state.put(HEAD_NODE_ID_OUTSIDE_SLURM, node_info)
+
+                self._internal_ip_cache[self.head_ip] = HEAD_NODE_ID_OUTSIDE_SLURM 
+
             else:
                 raise ValueError("Worker node must be launched under slurm. Change config file to fix")
         
-        if is_head_node:
-            self.head_ip = current_conf["head_ip"]
-            self.gcs_port = current_conf["gcs_port"]
-            self.ray_client_port = current_conf["ray_client_port"]
-            self.dashboard_port = current_conf["dashboad_port"]
-        
-
     def create_node_with_resources(
         self,
         node_config: Dict[str, Any],
@@ -292,11 +409,15 @@ class NodeProvider:
 
     def set_node_tags(self, node_id: str, tags: Dict[str, str]) -> None:
         """Sets the tag values (string dict) for the specified node."""
-        if node_id in self.lauched_nodes:
-            for tag, value in tags.items():
-                self.lauched_nodes[node_id][INFO_TAG_INDEX][tag] = value
-        else:
-            cli_logger.warning("Set tags is called non-exsiting node\n")
+        with self.state.file_lock:
+            workers = self.state.get()
+            if node_id in workers:
+                info = workers[node_id]
+                info["tags"].update(tags)
+                self.state.put(node_id, info)
+                return
+            
+        cli_logger.warning("Set tags is called non-exsiting node\n")
 
     def terminate_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         """Terminates the specified node.
@@ -304,7 +425,10 @@ class NodeProvider:
         Optionally return a mapping from deleted node ids to node
         metadata.
         """
-        if node_id not in self.lauched_nodes:
+
+        workers = self.state.get()
+
+        if node_id not in workers:
             cli_logger.warning("Trying to terminate non-exsiting node\n")
             return
         
@@ -313,9 +437,11 @@ class NodeProvider:
         else:
             slurm_cancel_job(node_id)
         
-        if self.lauched_nodes[node_id][INFO_IP_INDEX] in self._internal_ip_cache:
-            self._internal_ip_cache.pop(self.lauched_nodes[node_id][INFO_IP_INDEX])
-        self.lauched_nodes.pop(node_id)
+        self.state.delete(node_id)
+
+        # if self.launched_nodes[node_id][INFO_IP_INDEX] in self._internal_ip_cache:
+        #     self._internal_ip_cache.pop(self.launched_nodes[node_id][INFO_IP_INDEX])
+
 
         # TODO: check head? 
 
@@ -405,4 +531,3 @@ class NodeProvider:
     ) -> Dict[str, Any]:
         """Fills out missing "resources" field for available_node_types."""
         return cluster_config # TODO: Future: overide to prevent user from messing up 
-# TODO: ray down???
