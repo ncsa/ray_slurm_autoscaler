@@ -1,0 +1,70 @@
+# A unique identifier for the head node and workers of this cluster.
+cluster_name: slurm-cluster
+
+# The maximum number of workers nodes to launch in addition to the head
+# node.
+min_workers: 0
+max_workers: 2
+
+# The autoscaler will scale up the cluster faster with higher upscaling speed.
+# E.g., if the task requires adding more nodes then autoscaler will gradually
+# scale up the cluster in chunks of upscaling_speed*currently_running_nodes.
+# This number should be > 0.
+upscaling_speed: 1.0
+
+# If a node is idle for this many minutes, it will be removed.
+idle_timeout_minutes: 5
+
+provider:
+    type: external
+    module: ray.autoscaler._private.slurm.node_provider.NodeProvider
+    temp_folder_name: temp_script
+    template_path: /home/tingkai2/anaconda3/envs/ray-py3.7/lib/python3.7/site-packages/ray/autoscaler/_private/slurm/template/
+
+# Specify the type for the ray head node (as configured below).
+head_node_type: head_node
+
+# Empty setup commands for cluster launcher's checking
+initialization_commands: []
+setup_commands: []
+head_setup_commands: []
+worker_setup_commands: []
+
+file_mounts: {}
+cluster_synced_files: []
+
+
+# Specify the allowed pod types for this ray cluster and the resources they provide.
+available_node_types:
+  head_node:
+    resources: {"CPU": 1, "GPU": 0, "HPC": 1} # will be used by autoscaler scheduler
+    node_config:
+      head_node: 1 # needed by my create node 
+      under_slurm: 0 # whether the head node should be started under slurm
+      head_node_name : "kfcompute1" # only useful when launching head under slurm
+      head_ip: "192.168.1.1" 
+      gcs_port: "6379"
+      ray_client_port: "10001"
+      dashboad_port : "8265"
+      init_commands:
+        - conda activate ray-py3.7
+  
+  worker_node:
+    # Minimum number of Ray workers of this type.
+    min_workers: 0
+    # Maximum number of Ray workers of this type. Takes precedence over min_workers.
+    max_workers: 2
+
+    resources: {"CPU": 40, "GPU": 2, "HPC": 1} # will be used by autoscaler scheduler
+    node_config: 
+      head_node: 0 # needed by my create node 
+      under_slurm: 1 # doesn't matter. Worker node has to under slurm
+      init_commands:
+        - conda activate ray-py3.7
+  
+      
+# Should be empty for Slurm provider. Fill the commands in node types instead
+head_start_ray_commands: []
+
+# Should be empty for Slurm provider. Fill the commands in node types instead
+worker_start_ray_commands: []
