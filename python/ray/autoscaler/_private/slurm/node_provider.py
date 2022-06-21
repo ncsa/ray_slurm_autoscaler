@@ -10,7 +10,7 @@ from ray.autoscaler._private.slurm.slurm_commands import (
     slurm_cancel_job,
     slurm_launch_head,
     slurm_launch_worker,
-    slurm_get_node_name
+    slurm_get_node_ip
 )
 
 from threading import RLock
@@ -251,10 +251,16 @@ class NodeProvider:
         """Returns the internal ip (Ray ip) of the given node."""
         workers = self.state.get()
         if node_id in workers:
-            return workers[node_id]["ip"]
+            if workers[node_id]["ip"] == "-1" or workers[node_id]["ip"] == None:
+                worker_ip = slurm_get_node_ip(node_id)
+                workers[node_id]["ip"] = worker_ip
+                self.state.put(node_id, workers[node_id])
+                return worker_ip
+            else:
+                return workers[node_id]["ip"]
         else:
             cli_logger.warning("Get internal ip for non-existing node\n")
-            return {}
+            return ""
 
     def get_node_id(self, ip_address: str, use_internal_ip: bool = True) -> str:
         """Returns the node_id given an IP address.
@@ -340,7 +346,7 @@ class NodeProvider:
                     self.dashboard_port,
                     parsed_init_command
                 )
-                node_name = slurm_get_node_name(node_id)
+                node_name = slurm_get_node_ip(node_id)
                 node_info = {}
                 node_info["state"] = SLURM_STATE_RUNNING
                 node_info["tags"] = tags
@@ -356,7 +362,7 @@ class NodeProvider:
                         self.head_ip+":"+self.gcs_port,
                         parsed_init_command
                     )
-                    node_name = slurm_get_node_name(node_id)
+                    node_name = slurm_get_node_ip(node_id)
                     node_info = {}
                     node_info["state"] = SLURM_STATE_RUNNING
                     node_info["tags"] = tags

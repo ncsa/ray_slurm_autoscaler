@@ -8,7 +8,7 @@ Created by Tingkai Liu (tingkai2@illinois.edu) on June 17, 2022
 import subprocess
 import os
 from ray.autoscaler._private.cli_logger import cli_logger
-
+from ray.autoscaler._private.slurm import SLURM_IP_LOOKUP
 
 def slurm_cancel_job(job_id: str):
     if job_id.isdecimal():
@@ -43,6 +43,7 @@ def slurm_launch_worker(
     output = subprocess.check_output(slurm_command).decode()
 
     # Test slurm batch output
+    worker_job_id = ""
     comp = output.split()
     if comp[-1].isdecimal():
         worker_job_id = comp[-1]
@@ -83,6 +84,7 @@ def slurm_launch_head(
     output = subprocess.check_output(slurm_command).decode()
 
     # Test slurm batch output
+    head_job_id = ""
     comp = output.split()
     if comp[-1].isdecimal():
         head_job_id = comp[-1]
@@ -94,11 +96,16 @@ def slurm_launch_head(
     
     return head_job_id
 
-def slurm_get_node_name(job_id: str) -> str:
+def slurm_get_node_ip(job_id: str) -> str:
     slurm_command = ["squeue", "-j "+job_id]
     output = subprocess.check_output(slurm_command).decode().splitlines()
 
     if len(output) != 2:
         return "-1"
-    
-    return output[1].split()[-1]
+
+    node_name = output[1].split()[-1]
+    if node_name in SLURM_IP_LOOKUP:
+        return SLURM_IP_LOOKUP[node_name]
+    else:
+        return "-1"
+
