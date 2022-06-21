@@ -39,7 +39,7 @@ def slurm_launch_worker(
     f.write(template)
     f.close()
 
-    slurm_command = ["sbatch", temp_folder_name+"/head.slurm"]
+    slurm_command = ["sbatch", temp_folder_name+"/worker.slurm"]
     output = subprocess.check_output(slurm_command).decode()
 
     # Test slurm batch output

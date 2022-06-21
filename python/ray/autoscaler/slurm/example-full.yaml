@@ -41,6 +41,7 @@ cluster_synced_files: []
 # Specify the allowed pod types for this ray cluster and the resources they provide.
 available_node_types:
   head_node:
+    max_workers: 0
     resources: {"CPU": 1, "GPU": 0, "HPC": 1} # will be used by autoscaler scheduler
     node_config:
       head_node: 1 # needed by my create node 
@@ -55,7 +56,7 @@ available_node_types:
     # Maximum number of Ray workers of this type. Takes precedence over min_workers.
     max_workers: 2
 
-    resources: {"CPU": 40, "GPU": 2, "HPC": 1} # will be used by autoscaler scheduler
+    resources: {"CPU": 10, "GPU": 0, "HPC": 1} # will be used by autoscaler scheduler
     node_config: 
       head_node: 0 # needed by my create node 
       under_slurm: 1 # doesn't matter. Worker node has to under slurm

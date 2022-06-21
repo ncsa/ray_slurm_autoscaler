@@ -375,6 +375,7 @@ class NodeProvider:
                 command += " --ray-client-server-port=" + self.ray_client_port
                 command += " --dashboard-port=" + self.dashboard_port
                 command += " --num-cpus=0 --num-gpus=0"
+                command += " --autoscaling-config=~/ray_bootstrap_config.yaml"
                 os.system(command)
 
                 node_info = {}

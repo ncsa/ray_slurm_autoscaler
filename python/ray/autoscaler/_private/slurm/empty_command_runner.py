@@ -10,6 +10,7 @@ Created by Tingkai Liu (tingkai2@illinois.edu) on June 17, 2022
 from ray.autoscaler.command_runner import CommandRunnerInterface
 from typing import Any, List, Tuple, Dict, Optional
 from ray.autoscaler._private.cli_logger import cli_logger
+import os
 
 class EmptyCommandRunner(CommandRunnerInterface):
     """Interface to run commands on a remote cluster node.
@@ -90,12 +91,15 @@ class EmptyCommandRunner(CommandRunnerInterface):
     ) -> None:
         """Rsync files up to the cluster node.
 
+        Since all nodes on slurm shares a file system, this function simplily does direct copying
+
         Args:
             source: The (local) source directory or file.
             target: The (remote) destination path.
         """
 
         cli_logger.warning("The empty rsync up is called: {} to {}\n", source, target)
+        os.system("rsync -avz " + source + " " + target)
         return
 
     def run_rsync_down(
@@ -103,18 +107,21 @@ class EmptyCommandRunner(CommandRunnerInterface):
     ) -> None:
         """Rsync files down from the cluster node.
 
+        Since all nodes on slurm shares a file system, this function simplily does direct copying
+
         Args:
             source: The (remote) source directory or file.
             target: The (local) destination path.
         """
 
         cli_logger.warning("The empty rsync down is called: {} to {}\n", source, target)
+        os.system("rsync -avz " + source + " " + target)
         return
 
     def remote_shell_command_str(self) -> str:
         """Return the command the user can use to open a shell."""
         cli_logger.warning("The empty shell command is called\n")
-        return ""
+        return "bash"
 
     def run_init(
         self, *, as_head: bool, file_mounts: Dict[str, str], sync_run_yet: bool
