@@ -64,8 +64,8 @@ HEAD_UNDER_SLURM = False
 WORKER_UNDER_SLURM = True
 DEFAULT_TEMP_FOLDER_NAME = "temp_script"
 
-WAIT_NODE_INTERVAL = 10 # in second
-WAIT_NODE_INITIAL_TIME = 1 # in second. Use for the gap between launch and check 
+# WAIT_NODE_INTERVAL = 10 # in second
+# WAIT_NODE_INITIAL_TIME = 1 # in second. Use for the gap between launch and check 
 
 filelock_logger = logging.getLogger("filelock")
 filelock_logger.setLevel(logging.WARNING)
@@ -362,8 +362,14 @@ class NodeProvider:
                     parsed_init_command
                 )
 
-                time.sleep(WAIT_NODE_INITIAL_TIME)
-                self._wait_for_node_and_update(node_id, tags)
+                # Store pending info: will be updated by non_terminate_node
+                node_info = {}
+                node_info["state"] = NODE_STATE_PENDING
+                node_info["tags"] = tags
+                self.state.put(node_id, node_info)
+
+                # time.sleep(WAIT_NODE_INITIAL_TIME)
+                # self._wait_for_node_and_update(node_id, tags)
             else:
                 for _ in range(count):
                     node_id = slurm_launch_worker(
@@ -372,7 +378,14 @@ class NodeProvider:
                         self.head_ip+":"+self.gcs_port,
                         parsed_init_command
                     )
-                    self._wait_for_node_and_update(node_id, tags)
+
+                    # Store pending info: will be updated by non_terminate_node
+                    node_info = {}
+                    node_info["state"] = NODE_STATE_PENDING
+                    node_info["tags"] = tags
+                    self.state.put(node_id, node_info)
+                    
+                    # self._wait_for_node_and_update(node_id, tags)
 
         else:
             if is_head_node: # TODO: use a script
@@ -523,19 +536,7 @@ class NodeProvider:
             "use_internal_ip": use_internal_ip,
         }
 
-        # If the node is not up, stuck
-        if node_id != HEAD_NODE_ID_OUTSIDE_SLURM:
-            current_state = SLURM_JOB_PENDING
-            while True:
-                current_state = slurm_get_job_status(node_id)
-                if current_state == SLURM_JOB_RUNNING:
-                    break
-                elif current_state == SLURM_JOB_NOT_EXIST:
-                    cli_logger.warning("Tried to get command runner for non-existing node")
-                    return None
-                time.sleep(WAIT_NODE_INTERVAL)
-
-        return EmptyCommandRunner(**common_args)
+        return EmptyCommandRunner(**common_args) # TODO: distinguish under slurm or not 
 
         # if docker_config and docker_config["container_name"] != "":
         #     return DockerCommandRunner(docker_config, **common_args)
@@ -553,35 +554,4 @@ class NodeProvider:
         """Fills out missing "resources" field for available_node_types."""
         return cluster_config # TODO: Future: overide to prevent user from messing up 
 
-
-    '''  ********** Helper functions ************'''
-
-    def _wait_for_node_and_update(self, node_id: str, tags: Dict[str, str]) -> None:
-        '''Wait for a created node to be in running state and update node info        
-        '''
-
-        # Store pending info
-        node_info = {}
-        node_info["state"] = NODE_STATE_PENDING
-        node_info["tags"] = tags
-        self.state.put(node_id, node_info)
-
-        # Wait until the job is up
-        current_state = SLURM_JOB_PENDING
-        while True:
-            current_state = slurm_get_job_status(node_id)
-            if current_state == SLURM_JOB_RUNNING:
-                break
-            elif current_state == SLURM_JOB_NOT_EXIST:
-                self.state.delete(node_id)
-                return
-            time.sleep(WAIT_NODE_INTERVAL)
-        
-        # Update node info
-        node_ip = slurm_get_job_ip(node_id)
-        node_info["state"] = NODE_STATE_RUNNING
-        self.state.put(node_id, node_info)
-
-        self._internal_ip_cache[node_ip] = node_id
-        return
 

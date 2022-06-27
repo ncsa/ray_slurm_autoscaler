@@ -12,6 +12,11 @@ from typing import Any, List, Tuple, Dict, Optional
 from ray.autoscaler._private.cli_logger import cli_logger
 import os
 
+from ray.autoscaler._private.slurm.slurm_commands import (
+    slurm_get_job_status,
+    SLURM_JOB_RUNNING,
+)
+
 class EmptyCommandRunner(CommandRunnerInterface):
     """Interface to run commands on a remote cluster node.
 
@@ -83,6 +88,10 @@ class EmptyCommandRunner(CommandRunnerInterface):
             shutdown_after_run: if provided, shutdowns down the machine
             after executing the command with `sudo shutdown -h now`.
         """
+
+        if slurm_get_job_status(self.node_id) != SLURM_JOB_RUNNING:
+            raise Exception("Node {} is not ready".format(self.node_id))
+
         cli_logger.warning("The empty command runner is called with {}\n", cmd)
         return ""
 
