@@ -10,6 +10,15 @@ import os
 from ray.autoscaler._private.cli_logger import cli_logger
 from ray.autoscaler._private.slurm import SLURM_IP_LOOKUP
 
+# Public Const
+SLURM_JOB_RUNNING = "R"
+SLURM_JOB_PENDING = "PD"
+SLURM_JOB_NOT_EXIST = "E"
+
+# Private Const
+SLURM_INFO_NODE_IDX = -1
+SLURM_INFO_JOB_STATUS_IDX = 4
+
 def slurm_cancel_job(job_id: str):
     if job_id.isdecimal():
         os.system("scancel " + job_id)
@@ -50,8 +59,6 @@ def slurm_launch_worker(
     else:
         cli_logger.error("Slurm error when starting worker")
         raise ValueError("Slurm error when starting worker")
-    
-    # TODO: Check whether slurm task is pending
 
     return worker_job_id
     
@@ -91,21 +98,52 @@ def slurm_launch_head(
     else:
         cli_logger.error("Slurm error when starting head")
         raise ValueError("Slurm error when starting head")
-
-    # TODO: Check whether slurm task is pending
     
     return head_job_id
 
-def slurm_get_node_ip(job_id: str) -> str:
+def slurm_get_job_ip(job_id: str) -> str:
+    '''Return ip of the node which job_id is assigned to 
+
+        Assuming each job takes only one node
+    '''
+    
     slurm_command = ["squeue", "-j "+job_id]
-    output = subprocess.check_output(slurm_command).decode().splitlines()
+
+    try:
+        output = subprocess.check_output(slurm_command, stderr=subprocess.STDOUT).decode().splitlines()
+    except subprocess.CalledProcessError as e:
+        # cli_logger.warning(e)
+        return "-1"
 
     if len(output) != 2:
         return "-1"
 
-    node_name = output[1].split()[-1]
+    node_name = output[1].split()[SLURM_INFO_NODE_IDX]
     if node_name in SLURM_IP_LOOKUP:
         return SLURM_IP_LOOKUP[node_name]
     else:
         return "-1"
+
+def slurm_get_job_status(job_id: str) -> str:
+    '''Return the job status given the job id
+    '''
+
+    slurm_command = ["squeue", "-j "+job_id]
+
+    try:
+        output = subprocess.check_output(slurm_command, stderr=subprocess.STDOUT).decode().splitlines()
+    except subprocess.CalledProcessError as e: # happens when job not exist
+        # cli_logger.warning(e)
+        return SLURM_JOB_NOT_EXIST
+    
+    if len(output) != 2:
+        return SLURM_JOB_NOT_EXIST
+    
+    status = output[1].split()[SLURM_INFO_JOB_STATUS_IDX]
+    if status == "PD":
+        return SLURM_JOB_PENDING
+    elif status == "R":
+        return SLURM_JOB_RUNNING
+    else:
+        return SLURM_JOB_NOT_EXIST # Give warning?
 

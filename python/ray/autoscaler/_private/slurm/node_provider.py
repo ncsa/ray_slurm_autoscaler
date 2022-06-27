@@ -10,7 +10,11 @@ from ray.autoscaler._private.slurm.slurm_commands import (
     slurm_cancel_job,
     slurm_launch_head,
     slurm_launch_worker,
-    slurm_get_node_ip
+    slurm_get_job_ip,
+    slurm_get_job_status,
+    SLURM_JOB_RUNNING,
+    SLURM_JOB_PENDING,
+    SLURM_JOB_NOT_EXIST
 )
 
 from threading import RLock
@@ -20,6 +24,7 @@ from ray.autoscaler._private.cli_logger import cli_logger
 
 import copy
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -29,21 +34,28 @@ Created by Tingkai Liu (tingkai2@illinois.edu) on June 10, 2022
 Using the node_provider.py template
 
 node id: the slurm batch submission id for the node
-node ip: the node name in slurm
+node name: the node name under slurm
+node ip: the local node ip
 
 Information needed for each node:
 1. Slurm job id (major key)
 2. State: running, pending, terminated (should just be deleted)
-    Currently only have running state
-3. Tag (set and read by updator)
-4. IP (Slurm node name)
+3. Tag (set and read by updater)
 
 '''
 
 # Const
-SLURM_STATE_RUNNING = 0
-SLURM_STATE_PENDING = 1
-SLURM_STATE_TERMINATED = 2
+NODE_STATE_RUNNING = "running"
+NODE_STATE_PENDING = "pending"
+NODE_STATE_TERMINATED = "terminated"
+
+# Map slurm job status to node states
+SLURM_JOB_TRANS_MAP = {
+    SLURM_JOB_RUNNING : NODE_STATE_RUNNING,
+    SLURM_JOB_PENDING : NODE_STATE_PENDING,
+    SLURM_JOB_NOT_EXIST : NODE_STATE_TERMINATED
+}
+
 
 HEAD_NODE_ID_OUTSIDE_SLURM = "-1"
 
@@ -52,10 +64,19 @@ HEAD_UNDER_SLURM = False
 WORKER_UNDER_SLURM = True
 DEFAULT_TEMP_FOLDER_NAME = "temp_script"
 
+WAIT_NODE_INTERVAL = 10 # in second
+WAIT_NODE_INITIAL_TIME = 1 # in second. Use for the gap between launch and check 
+
 filelock_logger = logging.getLogger("filelock")
 filelock_logger.setLevel(logging.WARNING)
 
-# Keep the file operations from local.ClusterState
+'''Load/Store additional information on file for slurm cluster
+(modified from local.ClusterState)
+
+The node states on file may not be up to date---need to query slurm for updating
+The updates are performed by non-terminate-node() call
+
+'''
 class SlurmClusterState:
     def __init__(self, lock_path, save_path, provider_config):
         self.lock = RLock()
@@ -67,16 +88,6 @@ class SlurmClusterState:
             with self.file_lock:
                 if os.path.exists(self.save_path): # Reload the cluser states
                     workers = json.loads(open(self.save_path).read())
-                    
-                    # TODO: Can check each job id to see whether it is still running
-                    # head_config = workers.get(provider_config["head_ip"])
-                    # if (
-                    #     not head_config
-                    #     or head_config.get("tags", {}).get(TAG_RAY_NODE_KIND)
-                    #     != NODE_KIND_HEAD
-                    # ):
-                    #     workers = {}
-                    #     logger.info("Head IP changed - recreating cluster.")
                 else:
                     workers = {}
                     with open(self.save_path, "w") as f:
@@ -191,19 +202,25 @@ class NodeProvider:
         (e.g. is_running(node_id)). This means that non_terminate_nodes() must
         be called again to refresh results.
 
-        Examples:
-            >>> from ray.autoscaler.node_provider import NodeProvider
-            >>> from ray.autoscaler.tags import TAG_RAY_NODE_KIND
-            >>> provider = NodeProvider(...) # doctest: +SKIP
-            >>> provider.non_terminated_nodes( # doctest: +SKIP
-            ...     {TAG_RAY_NODE_KIND: "worker"})
-            ["node-1", "node-2"]
+        The states will be updated when called
 
         """
+        
         workers = self.state.get()
-        matching_ips = []
-        for worker_ip, info in workers.items():
-            if info["state"] == SLURM_STATE_TERMINATED: # Redundant for now: terminated nodes are deleted
+        matching_ids = []
+        for worker_id, info in workers.items():
+            
+            if worker_id != HEAD_NODE_ID_OUTSIDE_SLURM:
+                # Update node status
+                slurm_job_status = slurm_get_job_status(worker_id)
+                if SLURM_JOB_TRANS_MAP[slurm_job_status] != info["state"]:
+                    info["state"] = SLURM_JOB_TRANS_MAP[slurm_job_status]
+                    if info["state"] == NODE_STATE_TERMINATED:
+                        self.state.delete(worker_id)
+                    else:
+                        self.state.put(worker_id, info)
+            
+            if info["state"] == NODE_STATE_TERMINATED: 
                 continue
 
             ok = True
@@ -211,27 +228,33 @@ class NodeProvider:
                 if info["tags"].get(k) != v:
                     ok = False
                     break
-
             if ok:
-                matching_ips.append(worker_ip)
+                matching_ids.append(worker_id)
 
-        return matching_ips
+        return matching_ids
 
     def is_running(self, node_id: str) -> bool:
         """Return whether the specified node is running."""
 
-        workers = self.state.get()
+        # workers = self.state.get()
         
-        if node_id in workers:
-            return workers[node_id]["state"] == SLURM_STATE_RUNNING
+        # if node_id in workers:
+        #     return workers[node_id]["state"] == NODE_STATE_RUNNING
+        # else:
+        #     cli_logger.warning("Get is_running for non-existing node\n")
+        #     return False
+        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
+            return True # TODO:
         else:
-            cli_logger.warning("Get is_running for non-existing node\n")
-            return False
+            return slurm_get_job_status(node_id) == SLURM_JOB_RUNNING
+
 
     def is_terminated(self, node_id: str) -> bool:
         """Return whether the specified node is terminated."""
-        workers = self.state.get()
-        return node_id not in workers
+        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
+            return False # TODO:
+        else:
+            return slurm_get_job_status(node_id) == SLURM_JOB_NOT_EXIST
 
     def node_tags(self, node_id: str) -> Dict[str, str]:
         """Returns the tags of the given node (string dict)."""
@@ -249,18 +272,10 @@ class NodeProvider:
 
     def internal_ip(self, node_id: str) -> str:
         """Returns the internal ip (Ray ip) of the given node."""
-        workers = self.state.get()
-        if node_id in workers:
-            if workers[node_id]["ip"] == "-1" or workers[node_id]["ip"] == None:
-                worker_ip = slurm_get_node_ip(node_id)
-                workers[node_id]["ip"] = worker_ip
-                self.state.put(node_id, workers[node_id])
-                return worker_ip
-            else:
-                return workers[node_id]["ip"]
+        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
+            return self.head_ip
         else:
-            cli_logger.warning("Get internal ip for non-existing node\n")
-            return ""
+            return slurm_get_job_ip(node_id)
 
     def get_node_id(self, ip_address: str, use_internal_ip: bool = True) -> str:
         """Returns the node_id given an IP address.
@@ -285,7 +300,7 @@ class NodeProvider:
             else:
                 return self._external_ip_cache.get(ip_address)
 
-        if not find_node_id(): # can be optimized...the file is read multiple times
+        if not find_node_id(): 
             all_nodes = self.non_terminated_nodes({})
             ip_func = self.internal_ip if use_internal_ip else self.external_ip
             ip_cache = (
@@ -346,14 +361,9 @@ class NodeProvider:
                     self.dashboard_port,
                     parsed_init_command
                 )
-                node_name = slurm_get_node_ip(node_id)
-                node_info = {}
-                node_info["state"] = SLURM_STATE_RUNNING
-                node_info["tags"] = tags
-                node_info["ip"] = node_name
-                self.state.put(node_id, node_info)
 
-                self._internal_ip_cache[node_name] = node_id
+                time.sleep(WAIT_NODE_INITIAL_TIME)
+                self._wait_for_node_and_update(node_id, tags)
             else:
                 for _ in range(count):
                     node_id = slurm_launch_worker(
@@ -362,14 +372,7 @@ class NodeProvider:
                         self.head_ip+":"+self.gcs_port,
                         parsed_init_command
                     )
-                    node_name = slurm_get_node_ip(node_id)
-                    node_info = {}
-                    node_info["state"] = SLURM_STATE_RUNNING
-                    node_info["tags"] = tags
-                    node_info["ip"] = node_name
-                    self.state.put(node_id, node_info)
-
-                    self._internal_ip_cache[node_name] = node_id
+                    self._wait_for_node_and_update(node_id, tags)
 
         else:
             if is_head_node: # TODO: use a script
@@ -385,9 +388,8 @@ class NodeProvider:
                 os.system(command)
 
                 node_info = {}
-                node_info["state"] = SLURM_STATE_RUNNING
+                node_info["state"] = NODE_STATE_RUNNING
                 node_info["tags"] = tags
-                node_info["ip"] = self.head_ip
                 self.state.put(HEAD_NODE_ID_OUTSIDE_SLURM, node_info)
 
                 self._internal_ip_cache[self.head_ip] = HEAD_NODE_ID_OUTSIDE_SLURM 
@@ -521,6 +523,18 @@ class NodeProvider:
             "use_internal_ip": use_internal_ip,
         }
 
+        # If the node is not up, stuck
+        if node_id != HEAD_NODE_ID_OUTSIDE_SLURM:
+            current_state = SLURM_JOB_PENDING
+            while True:
+                current_state = slurm_get_job_status(node_id)
+                if current_state == SLURM_JOB_RUNNING:
+                    break
+                elif current_state == SLURM_JOB_NOT_EXIST:
+                    cli_logger.warning("Tried to get command runner for non-existing node")
+                    return None
+                time.sleep(WAIT_NODE_INTERVAL)
+
         return EmptyCommandRunner(**common_args)
 
         # if docker_config and docker_config["container_name"] != "":
@@ -538,3 +552,36 @@ class NodeProvider:
     ) -> Dict[str, Any]:
         """Fills out missing "resources" field for available_node_types."""
         return cluster_config # TODO: Future: overide to prevent user from messing up 
+
+
+    '''  ********** Helper functions ************'''
+
+    def _wait_for_node_and_update(self, node_id: str, tags: Dict[str, str]) -> None:
+        '''Wait for a created node to be in running state and update node info        
+        '''
+
+        # Store pending info
+        node_info = {}
+        node_info["state"] = NODE_STATE_PENDING
+        node_info["tags"] = tags
+        self.state.put(node_id, node_info)
+
+        # Wait until the job is up
+        current_state = SLURM_JOB_PENDING
+        while True:
+            current_state = slurm_get_job_status(node_id)
+            if current_state == SLURM_JOB_RUNNING:
+                break
+            elif current_state == SLURM_JOB_NOT_EXIST:
+                self.state.delete(node_id)
+                return
+            time.sleep(WAIT_NODE_INTERVAL)
+        
+        # Update node info
+        node_ip = slurm_get_job_ip(node_id)
+        node_info["state"] = NODE_STATE_RUNNING
+        self.state.put(node_id, node_info)
+
+        self._internal_ip_cache[node_ip] = node_id
+        return
+
