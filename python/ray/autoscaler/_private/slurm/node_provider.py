@@ -169,6 +169,9 @@ class NodeProvider:
         self.temp_folder = temp_folder_name
         self.template_folder = provider_config["template_path"]
 
+        if not self.template_folder.endswith('/'):
+            self.template_folder += '/'
+
         self.head_started = False
         self.head_ip = provider_config["head_ip"]
         self.gcs_port = provider_config["gcs_port"]
@@ -346,12 +349,12 @@ class NodeProvider:
             else:
                 under_slurm = WORKER_UNDER_SLURM
         
+        parsed_init_command = ""
+        for init in current_conf["init_commands"]:
+            parsed_init_command += init + "\n"
+        
         if under_slurm:
-            parsed_init_command = ""
-            for init in current_conf["init_commands"]:
-                parsed_init_command += init + "\n"
-            
-            if is_head_node:
+            if is_head_node: # head node under slurm
                 node_id = slurm_launch_head(
                     self.template_folder,
                     self.temp_folder, 
@@ -368,9 +371,7 @@ class NodeProvider:
                 node_info["tags"] = tags
                 self.state.put(node_id, node_info)
 
-                # time.sleep(WAIT_NODE_INITIAL_TIME)
-                # self._wait_for_node_and_update(node_id, tags)
-            else:
+            else: # worker node under slurm
                 for _ in range(count):
                     node_id = slurm_launch_worker(
                         self.template_folder,
@@ -384,21 +385,25 @@ class NodeProvider:
                     node_info["state"] = NODE_STATE_PENDING
                     node_info["tags"] = tags
                     self.state.put(node_id, node_info)
-                    
-                    # self._wait_for_node_and_update(node_id, tags)
 
-        else:
-            if is_head_node: # TODO: use a script
-                command = ""
-                for init in current_conf["init_commands"]:
-                    command += init + " && "
-                command += "ray start --head"
-                command += " --port=" + self.gcs_port
-                command += " --ray-client-server-port=" + self.ray_client_port
-                command += " --dashboard-port=" + self.dashboard_port
-                command += " --num-cpus=0 --num-gpus=0"
-                command += " --autoscaling-config=~/ray_bootstrap_config.yaml"
-                os.system(command)
+        else: # not under slurm
+            if is_head_node: 
+                
+                f = open(self.template_folder+"head.sh", "r")
+                template = f.read()
+                f.close()
+                
+                template = template.replace("[_PY_HEAD_NODE_IP_]", self.head_ip)
+                template = template.replace("[_PY_PORT_]", self.gcs_port)
+                template = template.replace("[_PY_INIT_COMMAND_]", parsed_init_command)
+                template = template.replace("[_PY_RAY_CLIENT_PORT_]", self.ray_client_port)
+                template = template.replace("[_PY_DASHBOARD_PORT_]", self.dashboard_port)
+
+                f = open(self.temp_folder+"/head.sh", "w")
+                f.write(template)
+                f.close()
+
+                os.system("bash -l " + self.temp_folder+"/head.sh") # TODO: check error
 
                 node_info = {}
                 node_info["state"] = NODE_STATE_RUNNING
@@ -406,6 +411,17 @@ class NodeProvider:
                 self.state.put(HEAD_NODE_ID_OUTSIDE_SLURM, node_info)
 
                 self._internal_ip_cache[self.head_ip] = HEAD_NODE_ID_OUTSIDE_SLURM 
+
+                # Prepare the script for terminating node
+                f = open(self.template_folder+"end_head.sh", "r")
+                template = f.read()
+                f.close()
+                
+                template = template.replace("[_PY_INIT_COMMAND_]", parsed_init_command)
+
+                f = open(self.temp_folder+"/end_head.sh", "w")
+                f.write(template)
+                f.close()
 
             else:
                 raise ValueError("Worker node must be launched under slurm. Change config file to fix")
@@ -455,7 +471,7 @@ class NodeProvider:
             return
         
         if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
-            os.system("ray stop") # TODO: env init
+            os.system("bash -l " + self.temp_folder+"/end_head.sh") # TODO: check error
         else:
             slurm_cancel_job(node_id)
         
@@ -534,6 +550,7 @@ class NodeProvider:
             "cluster_name": cluster_name,
             "process_runner": process_runner,
             "use_internal_ip": use_internal_ip,
+            "under_slurm" : node_id != HEAD_NODE_ID_OUTSIDE_SLURM,
         }
 
         return EmptyCommandRunner(**common_args) # TODO: distinguish under slurm or not 

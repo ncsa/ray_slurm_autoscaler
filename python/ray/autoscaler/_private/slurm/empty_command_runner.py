@@ -37,6 +37,7 @@ class EmptyCommandRunner(CommandRunnerInterface):
         cluster_name,
         process_runner,
         use_internal_ip,
+        under_slurm: bool,
     ):
         self.cluster_name = cluster_name
         self.log_prefix = log_prefix
@@ -44,6 +45,7 @@ class EmptyCommandRunner(CommandRunnerInterface):
         self.node_id = node_id
         self.use_internal_ip = use_internal_ip
         self.provider = provider
+        self.under_slurm = under_slurm
         # self.ssh_private_key = auth_config.get("ssh_private_key")
         # self.ssh_user = auth_config["ssh_user"]
         # self.ssh_control_path = ssh_control_path
@@ -89,8 +91,9 @@ class EmptyCommandRunner(CommandRunnerInterface):
             after executing the command with `sudo shutdown -h now`.
         """
 
-        if slurm_get_job_status(self.node_id) != SLURM_JOB_RUNNING:
-            raise Exception("Node {} is not ready".format(self.node_id))
+        if self.under_slurm:
+            if slurm_get_job_status(self.node_id) != SLURM_JOB_RUNNING:
+                raise Exception("Node {} is not ready".format(self.node_id))
 
         cli_logger.warning("The empty command runner is called with {}\n", cmd)
         return ""

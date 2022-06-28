@@ -113,16 +113,16 @@ def slurm_get_job_ip(job_id: str) -> str:
         output = subprocess.check_output(slurm_command, stderr=subprocess.STDOUT).decode().splitlines()
     except subprocess.CalledProcessError as e:
         # cli_logger.warning(e)
-        return "-1"
+        return None
 
     if len(output) != 2:
-        return "-1"
+        return None
 
     node_name = output[1].split()[SLURM_INFO_NODE_IDX]
     if node_name in SLURM_IP_LOOKUP:
         return SLURM_IP_LOOKUP[node_name]
     else:
-        return "-1"
+        return None
 
 def slurm_get_job_status(job_id: str) -> str:
     '''Return the job status given the job id
