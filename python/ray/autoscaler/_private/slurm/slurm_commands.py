@@ -6,7 +6,6 @@ Created by Tingkai Liu (tingkai2@illinois.edu) on June 17, 2022
 '''
 
 import subprocess
-import os
 from ray.autoscaler._private.cli_logger import cli_logger
 from ray.autoscaler._private.slurm import SLURM_IP_LOOKUP
 
@@ -21,7 +20,7 @@ SLURM_INFO_JOB_STATUS_IDX = 4
 
 def slurm_cancel_job(job_id: str):
     if job_id.isdecimal():
-        os.system("scancel " + job_id)
+        subprocess.run(["scancel", job_id])
     else:
         cli_logger.warning("Slurm interface: invalid job id")
 

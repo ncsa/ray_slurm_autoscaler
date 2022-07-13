@@ -1,3 +1,12 @@
+
+"""Ray-Slurm Autoscaler Interface
+
+Created by Tingkai Liu (tingkai2@illinois.edu) on June 10, 2022
+Using the node_provider.py template
+
+"""
+
+import subprocess
 import json
 import logging
 from types import ModuleType
@@ -28,22 +37,6 @@ import time
 
 logger = logging.getLogger(__name__)
 
-'''Ray-Slurm Interface
-
-Created by Tingkai Liu (tingkai2@illinois.edu) on June 10, 2022
-Using the node_provider.py template
-
-node id: the slurm batch submission id for the node
-node name: the node name under slurm
-node ip: the local node ip
-
-Information needed for each node:
-1. Slurm job id (major key)
-2. State: running, pending, terminated (should just be deleted)
-3. Tag (set and read by updater)
-
-'''
-
 # Const
 NODE_STATE_RUNNING = "running"
 NODE_STATE_PENDING = "pending"
@@ -57,28 +50,31 @@ SLURM_JOB_TRANS_MAP = {
 }
 
 
-HEAD_NODE_ID_OUTSIDE_SLURM = "-1"
+HEAD_NODE_ID_OUTSIDE_SLURM = "-1" # TODO: Pid? 
 
 # Default values if not provided in the node config
 HEAD_UNDER_SLURM = False
 WORKER_UNDER_SLURM = True
 DEFAULT_TEMP_FOLDER_NAME = "temp_script"
 
-# WAIT_NODE_INTERVAL = 10 # in second
-# WAIT_NODE_INITIAL_TIME = 1 # in second. Use for the gap between launch and check 
-
 filelock_logger = logging.getLogger("filelock")
 filelock_logger.setLevel(logging.WARNING)
 
-'''Load/Store additional information on file for slurm cluster
-(modified from local.ClusterState)
-
-The node states on file may not be up to date---need to query slurm for updating
-The updates are performed by non-terminate-node() call
-
-'''
 class SlurmClusterState:
+    """Maintain additional information on file for slurm cluster
+    (modified from local.ClusterState)
+
+    Information needed for each node:
+    1. Slurm job id (major key)
+    2. State: running, pending, terminated (should just be deleted)
+    3. Tag (set and read by updater)
+
+    The node states on file may not be up to date---need to query slurm for updating
+    The updates are performed by non-terminate-node() call
+    """
+
     def __init__(self, lock_path, save_path, provider_config):
+        
         self.lock = RLock()
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         self.file_lock = FileLock(lock_path)
@@ -101,12 +97,18 @@ class SlurmClusterState:
                 )
 
     def get(self):
+        """Return all the node info on file.
+        """
+        
         with self.lock:
             with self.file_lock:
                 workers = json.loads(open(self.save_path).read())
                 return workers
 
     def put(self, worker_id, info):
+        """Update the node info for certain worker_id.
+        """
+        
         assert "tags" in info
         assert "state" in info
         with self.lock:
@@ -121,6 +123,8 @@ class SlurmClusterState:
                     f.write(json.dumps(workers))
     
     def delete(self, worker_id: str):
+        """Delete a worker from file.
+        """
         with self.lock:
             with self.file_lock:
                 workers = self.get()
@@ -143,19 +147,115 @@ class NodeProvider:
     define new implementations of NodeProvider for use with the "external" node
     provider option.
 
-    NodeProviders are namespaced by the `cluster_name` parameter; they only
-    operate on nodes within that namespace.
+    The APIs are classified into 3 main catagories:
+        1. Cluster config
+            __init__ (constructor)
+            bootstrap_config()
+            fillout_available_node_types_resources()
+            prepare_for_head_node()
+            max_terminate_nodes()
+            is_readonly()
+        2. Node operations (creation, setup, and termination)
+            create_node()
+            create_node_with_resources()
+            get_command_runner()
+            terminate_node()
+            terminate_nodes()
+        3. Node info setting and query
+            non_terminated_nodes()
+            is_running()
+            is_terminated()
+            set_node_tags()
+            node_tags()
+            external_ip()
+            internal_ip()
+            get_node_id()
+    
+    Node information includes node id, node states, and node tags. Additional 
+    information could also be stored for customize platform.
 
-    Nodes may be in one of three states: {pending, running, terminated}. Nodes
-    appear immediately once started by `create_node`, and transition
-    immediately to terminated when `terminate_node` is called.
+    **Node id**:
+    Node ids should be unqiue for every node.  
+
+    **Node states**:
+    Nodes may be in one of three states: {pending, running, terminated}. 
+        pending: The node has been created, but haven't started the Ray runtime
+        running: The node has active Ray runtime
+        terminated: The node has been terminated
+    The states may be represented in any kind of format internally, as long as 
+    is_running(), is_terminated(), and non_terminate_nodes() reflects them correctly. 
+
+    **Node tag**:
+    Node tags are formatted as Dict[str, str], with key to be tag name and value to be
+    tag value. For example, a node can have tag 
+        {TAG_RAY_NODE_KIND  : NODE_KIND_WORKER, 
+         TAG_RAY_NODE_STATUS: STATUS_UP_TO_DATE}
+    where "TAG_RAY_NODE_KIND" and "TAG_RAY_NODE_STATUS" are the tag names, and 
+    "NODE_KIND_WORKER" and "STATUS_UP_TO_DATE" are the tag values for this node. 
+    If tag-specfic operations are needed, which is not common, see
+    ray.autoscaler.tags for detail tag names and values. 
+
+    Other assumptions made by the autoscaler:
+    #. NodeProviders are namespaced by the `cluster_name` parameter; they only
+    operate on nodes within that namespace.
+    #. The "nodes" are VM-like that could run setup commands remotely (such as via SSH)
+    #. The IP addresses of the nodes are unique
+    #. Nodes should appear immediately once started by `create_node`, and transition
+    immediately to terminated when `terminate_node` is called. This means any APIs,
+    that are affected by the nodes states, especially non_terminate_nodes(), should 
+    reflect the changes immediately. 
+    #. The instance of this class can be constructed and destructed from multiple threads
+    simultaneously. As a result:
+        1. All data operations should be thread-safe
+        2. State information should not be stored as class variables that are lost when 
+            the class instance is destructed
+    
+    A general overview of how autoscaler is connected to node_provider:
+
+    The process for launching a ray node: TODO:
+(1) Calls "create_node". This only allocate some physical resources and doesn't really starts the ray runtime, e.g. K8s just gets a new port
+(2) Uses "command runner" (such as SSH or K8s interface) to run the init commands on the allocated node to start the ray runtime.
+
+
+    *** About Slurm node_provider: ***
+
+    The nodes are distinguished in three different ways:
+        node id: the slurm batch submission id for the node
+        node name: the node name under slurm
+        node ip: the local node ip
+
+    Design hack:
+    The "run setup command after a node is created" doesn't fit the slurm model. 
+
+
+    The following things are stored in the temperory folder:
+        1. The cluster states storage file
+        2. The file lock for cluster states storage file
+        3. Modified (from template) Slurm/Bash scripts for launching specific nodes
+
+    Notes on IP: (how they are used)
+
     """
 
     def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
-        # LTK's note: provider config only has the "provider section" in the yaml
+        """Init the node provider class.
+
+        Args:
+            provider_config: The "provider" section of the autoscaler config yaml
+            cluster_name: The "cluster_name" section of the autoscaler config yaml
+
+        Three main things are done:
+            1. Store the necessary information from provider_config
+            2. Create the temperory folder (if not exist) and assign file paths for 
+                cluster states storage and file lock
+            3. Re-construct the cluster state information from file, if exist
+
+        """
         
         self.provider_config = provider_config
         self.cluster_name = cluster_name
+
+        # Helpers for get_node_id() function
         self._internal_ip_cache: Dict[str, str] = {} # node ip : node id
         self._external_ip_cache: Dict[str, str] = {} # should not be used
 
@@ -172,7 +272,6 @@ class NodeProvider:
         if not self.template_folder.endswith('/'):
             self.template_folder += '/'
 
-        self.head_started = False
         self.head_ip = provider_config["head_ip"]
         self.gcs_port = provider_config["gcs_port"]
         self.ray_client_port = provider_config["ray_client_port"]
@@ -189,6 +288,54 @@ class NodeProvider:
         )
 
 
+    @staticmethod
+    def bootstrap_config(cluster_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Bootstraps the cluster config by adding env defaults if needed.
+        
+        Args:
+            cluster_config: The whole autoscaler config yaml
+
+        """
+        return cluster_config
+
+    @staticmethod
+    def fillout_available_node_types_resources(
+        cluster_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Fills out missing "resources" field for available_node_types.
+        
+        Args:
+            cluster_config: The whole autoscaler config yaml
+        
+        """
+        # TODO: Future: overide to prevent user from messing up. Can also fill in default value here
+        return cluster_config  
+    
+    def prepare_for_head_node(self, cluster_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Returns a new cluster config with custom configs for head node.
+        
+        Args:
+            cluster_config: The whole autoscaler config yaml
+        
+        """
+        return cluster_config
+
+    @property
+    def max_terminate_nodes(self) -> Optional[int]:
+        """The maximum number of nodes which can be terminated in one single
+        API request. By default, this is "None", which means that the node
+        provider's underlying API allows infinite requests to be terminated
+        with one request.
+
+        For example, AWS only allows 1000 nodes to be terminated
+        at once; to terminate more, we must issue multiple separate API
+        requests. If the limit is infinity, then simply set this to None.
+
+        This may be overridden. The value may be useful when overriding the
+        "terminate_nodes" method.
+        """
+        return None
+
     def is_readonly(self) -> bool:
         """Returns whether this provider is readonly.
 
@@ -196,138 +343,21 @@ class NodeProvider:
         """
         return False
 
-    def non_terminated_nodes(self, tag_filters: Dict[str, str]) -> List[str]:
-        """Return a list of node ids filtered by the specified tags dict.
 
-        This list must not include terminated nodes. For performance reasons,
-        providers are allowed to cache the result of a call to
-        non_terminated_nodes() to serve single-node queries
-        (e.g. is_running(node_id)). This means that non_terminate_nodes() must
-        be called again to refresh results.
-
-        The states will be updated when called
-
-        """
-        
-        workers = self.state.get()
-        matching_ids = []
-        for worker_id, info in workers.items():
-            
-            if worker_id != HEAD_NODE_ID_OUTSIDE_SLURM:
-                # Update node status
-                slurm_job_status = slurm_get_job_status(worker_id)
-                if SLURM_JOB_TRANS_MAP[slurm_job_status] != info["state"]:
-                    info["state"] = SLURM_JOB_TRANS_MAP[slurm_job_status]
-                    if info["state"] == NODE_STATE_TERMINATED:
-                        self.state.delete(worker_id)
-                    else:
-                        self.state.put(worker_id, info)
-            
-            if info["state"] == NODE_STATE_TERMINATED: 
-                continue
-
-            ok = True
-            for k, v in tag_filters.items():
-                if info["tags"].get(k) != v:
-                    ok = False
-                    break
-            if ok:
-                matching_ids.append(worker_id)
-
-        return matching_ids
-
-    def is_running(self, node_id: str) -> bool:
-        """Return whether the specified node is running."""
-
-        # workers = self.state.get()
-        
-        # if node_id in workers:
-        #     return workers[node_id]["state"] == NODE_STATE_RUNNING
-        # else:
-        #     cli_logger.warning("Get is_running for non-existing node\n")
-        #     return False
-        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
-            return True # TODO:
-        else:
-            return slurm_get_job_status(node_id) == SLURM_JOB_RUNNING
-
-
-    def is_terminated(self, node_id: str) -> bool:
-        """Return whether the specified node is terminated."""
-        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
-            return False # TODO:
-        else:
-            return slurm_get_job_status(node_id) == SLURM_JOB_NOT_EXIST
-
-    def node_tags(self, node_id: str) -> Dict[str, str]:
-        """Returns the tags of the given node (string dict)."""
-
-        workers = self.state.get()
-        if node_id in workers:
-            return workers[node_id]["tags"]
-        else:
-            cli_logger.warning("Get tags for non-existing node\n")
-            return {}
-
-    def external_ip(self, node_id: str) -> str:
-        """Returns the external ip of the given node."""
-        raise NotImplementedError("Must use internal IPs with slurm")
-
-    def internal_ip(self, node_id: str) -> str:
-        """Returns the internal ip (Ray ip) of the given node."""
-        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
-            return self.head_ip
-        else:
-            return slurm_get_job_ip(node_id)
-
-    def get_node_id(self, ip_address: str, use_internal_ip: bool = True) -> str:
-        """Returns the node_id given an IP address.
-
-        Assumes ip-address is unique per node.
-
-        Args:
-            ip_address: Address of node.
-            use_internal_ip: Whether the ip address is
-                public or private.
-
-        Raises:
-            ValueError if not found.
-        """
-
-        if not use_internal_ip:
-            raise ValueError("Must use internal IPs with slurm")
-
-        def find_node_id():
-            if use_internal_ip:
-                return self._internal_ip_cache.get(ip_address)
-            else:
-                return self._external_ip_cache.get(ip_address)
-
-        if not find_node_id(): 
-            all_nodes = self.non_terminated_nodes({})
-            ip_func = self.internal_ip if use_internal_ip else self.external_ip
-            ip_cache = (
-                self._internal_ip_cache if use_internal_ip else self._external_ip_cache
-            )
-            for node_id in all_nodes:
-                ip_cache[ip_func(node_id)] = node_id
-
-        if not find_node_id():
-            if use_internal_ip:
-                known_msg = f"Worker internal IPs: {list(self._internal_ip_cache)}"
-            else:
-                known_msg = f"Worker external IP: {list(self._external_ip_cache)}"
-            raise ValueError(f"ip {ip_address} not found. " + known_msg)
-
-        return find_node_id()
-        
-
-    def create_node( 
+    def create_node( # TODO: set memory constraint
         self, node_config: Dict[str, Any], tags: Dict[str, str], count: int
     ) -> Optional[Dict[str, Any]]:
         """Creates a number of nodes within the namespace.
 
-        Optionally returns a mapping from created node ids to node metadata.
+        Args:
+            node_config: the "node_config" section of specific node type (under
+                "available_node_types" section) in the autoscaler config yaml.
+                The node type is decided by the node launcher. 
+            tags: the tags to be set to the created nodes
+            count: the number of nodes to be created
+
+        Optionally returns a mapping from created node ids to node metadata. 
+        The return value is not used by the autoscaler, but may be useful for debugging.
         """
 
         # LTK's note: node_config only contains the "node_cofig" filed of a specific node type
@@ -403,7 +433,7 @@ class NodeProvider:
                 f.write(template)
                 f.close()
 
-                os.system("bash -l " + self.temp_folder+"/head.sh") # TODO: check error
+                subprocess.run(["bash", "-l", self.temp_folder+"/head.sh"]) # TODO: check error
 
                 node_info = {}
                 node_info["state"] = NODE_STATE_RUNNING
@@ -438,84 +468,15 @@ class NodeProvider:
         This is the method actually called by the autoscaler. Prefer to
         implement this when possible directly, otherwise it delegates to the
         create_node() implementation.
+
+        The node type is determined by the autoscaler 
         """
 
         # LTK's note: the resource config for a specific node type is fixed
         # which will be handled by create_node() using the node_config
 
         return self.create_node(node_config, tags, count)
-
-    def set_node_tags(self, node_id: str, tags: Dict[str, str]) -> None:
-        """Sets the tag values (string dict) for the specified node."""
-        with self.state.file_lock:
-            workers = self.state.get()
-            if node_id in workers:
-                info = workers[node_id]
-                info["tags"].update(tags)
-                self.state.put(node_id, info)
-                return
-            
-        cli_logger.warning("Set tags is called non-exsiting node\n")
-
-    def terminate_node(self, node_id: str) -> Optional[Dict[str, Any]]:
-        """Terminates the specified node.
-
-        Optionally return a mapping from deleted node ids to node
-        metadata.
-        """
-
-        workers = self.state.get()
-
-        if node_id not in workers:
-            cli_logger.warning("Trying to terminate non-exsiting node\n")
-            return
-        
-        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
-            os.system("bash -l " + self.temp_folder+"/end_head.sh") # TODO: check error
-        else:
-            slurm_cancel_job(node_id)
-        
-        self.state.delete(node_id)
-
-        # if self.launched_nodes[node_id][INFO_IP_INDEX] in self._internal_ip_cache:
-        #     self._internal_ip_cache.pop(self.launched_nodes[node_id][INFO_IP_INDEX])
-
-
-        # TODO: check head? 
-
-
-    def terminate_nodes(self, node_ids: List[str]) -> Optional[Dict[str, Any]]:
-        """Terminates a set of nodes.
-
-        May be overridden with a batch method, which optionally may return a
-        mapping from deleted node ids to node metadata.
-        """
-        for node_id in node_ids:
-            logger.info("NodeProvider: {}: Terminating node".format(node_id))
-            self.terminate_node(node_id)
-        return None
-
-    @property
-    def max_terminate_nodes(self) -> Optional[int]:
-        """The maximum number of nodes which can be terminated in one single
-        API request. By default, this is "None", which means that the node
-        provider's underlying API allows infinite requests to be terminated
-        with one request.
-
-        For example, AWS only allows 1000 nodes to be terminated
-        at once; to terminate more, we must issue multiple separate API
-        requests. If the limit is infinity, then simply set this to None.
-
-        This may be overridden. The value may be useful when overriding the
-        "terminate_nodes" method.
-        """
-        return None
-
-    @staticmethod
-    def bootstrap_config(cluster_config: Dict[str, Any]) -> Dict[str, Any]:
-        """Bootstraps the cluster config by adding env defaults if needed."""
-        return cluster_config
-
+    
     def get_command_runner(
         self,
         log_prefix: str,
@@ -526,7 +487,7 @@ class NodeProvider:
         use_internal_ip: bool,
         docker_config: Optional[Dict[str, Any]] = None,
     ) -> CommandRunnerInterface:
-        """Returns the CommandRunner class used to perform SSH commands.
+        """Returns the CommandRunner class used to run commands on specific node.
 
         Args:
         log_prefix(str): stores "NodeUpdater: {}: ".format(<node_id>). Used
@@ -553,22 +514,193 @@ class NodeProvider:
             "under_slurm" : node_id != HEAD_NODE_ID_OUTSIDE_SLURM,
         }
 
-        return EmptyCommandRunner(**common_args) # TODO: distinguish under slurm or not 
-
         # if docker_config and docker_config["container_name"] != "":
         #     return DockerCommandRunner(docker_config, **common_args)
         # else:
         #     return SSHCommandRunner(**common_args)
 
-    def prepare_for_head_node(self, cluster_config: Dict[str, Any]) -> Dict[str, Any]:
-        """Returns a new cluster config with custom configs for head node."""
-        return cluster_config
+        return EmptyCommandRunner(**common_args)  
 
-    @staticmethod
-    def fillout_available_node_types_resources(
-        cluster_config: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Fills out missing "resources" field for available_node_types."""
-        return cluster_config # TODO: Future: overide to prevent user from messing up 
+    def terminate_node(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Terminates the specified node.
+
+        Optionally return a mapping from deleted node ids to node
+        metadata.
+        """
+
+        workers = self.state.get()
+
+        if node_id not in workers:
+            cli_logger.warning("Trying to terminate non-exsiting node\n")
+            return
+        
+        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
+            subprocess.run(["bash", "-l", self.temp_folder+"/end_head.sh"]) # TODO: check error
+        else:
+            slurm_cancel_job(node_id)
+        
+        self.state.delete(node_id)
+
+        # if self.launched_nodes[node_id][INFO_IP_INDEX] in self._internal_ip_cache:
+        #     self._internal_ip_cache.pop(self.launched_nodes[node_id][INFO_IP_INDEX])
 
 
+        # TODO: check head? 
+
+
+    def terminate_nodes(self, node_ids: List[str]) -> Optional[Dict[str, Any]]:
+        """Terminates a set of nodes.
+
+        May be overridden with a batch method, which optionally may return a
+        mapping from deleted node ids to node metadata.
+        """
+        for node_id in node_ids:
+            logger.info("NodeProvider: {}: Terminating node".format(node_id))
+            self.terminate_node(node_id)
+        return None
+
+
+    def non_terminated_nodes(self, tag_filters: Dict[str, str]) -> List[str]:
+        """Return a list of node ids filtered by the specified tags dict.
+
+        This list must not include terminated nodes. For performance reasons,
+        providers are allowed to cache the result of a call to
+        non_terminated_nodes() to serve single-node queries
+        (e.g. is_running(node_id)). This means that non_terminate_nodes() must
+        be called again to refresh results.
+
+        The node states on file will be updated by checking the slurm job status.
+        Other node information on file remains unchanged
+
+        Args:
+            tag_filers: key: the tag name; value: the expected tag value
+
+        """
+        
+        workers = self.state.get()
+        matching_ids = []
+        for worker_id, info in workers.items():
+            
+            if worker_id != HEAD_NODE_ID_OUTSIDE_SLURM:
+                # Update node status
+                slurm_job_status = slurm_get_job_status(worker_id)
+                if SLURM_JOB_TRANS_MAP[slurm_job_status] != info["state"]:
+                    info["state"] = SLURM_JOB_TRANS_MAP[slurm_job_status]
+                    if info["state"] == NODE_STATE_TERMINATED:
+                        self.state.delete(worker_id)
+                    else:
+                        self.state.put(worker_id, info)
+            
+            if info["state"] == NODE_STATE_TERMINATED: 
+                continue
+
+            ok = True
+            for k, v in tag_filters.items():
+                if info["tags"].get(k) != v:
+                    ok = False
+                    break
+            if ok:
+                matching_ids.append(worker_id)
+
+        return matching_ids
+
+    def is_running(self, node_id: str) -> bool:
+        """Return whether the specified node is running."""
+
+        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
+            return True # TODO:
+        else:
+            return slurm_get_job_status(node_id) == SLURM_JOB_RUNNING
+
+
+    def is_terminated(self, node_id: str) -> bool:
+        """Return whether the specified node is terminated."""
+        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
+            return False # TODO:
+        else:
+            return slurm_get_job_status(node_id) == SLURM_JOB_NOT_EXIST
+    
+    def set_node_tags(self, node_id: str, tags: Dict[str, str]) -> None:
+        """Sets the tag values (string dict) for the specified node.
+        
+            Args:
+                node_id: the node id
+                tags: key: the tag name; value: the tag value
+        """
+        with self.state.file_lock:
+            workers = self.state.get()
+            if node_id in workers:
+                info = workers[node_id]
+                info["tags"].update(tags)
+                self.state.put(node_id, info)
+                return
+            
+        cli_logger.warning("Set tags is called non-exsiting node\n")
+
+    def node_tags(self, node_id: str) -> Dict[str, str]:
+        """Returns the tags of the given node (string dict)."""
+
+        workers = self.state.get()
+        if node_id in workers:
+            return workers[node_id]["tags"]
+        else:
+            cli_logger.warning("Get tags for non-existing node\n")
+            return {}
+
+    def external_ip(self, node_id: str) -> Optional[str]:
+        """Returns the external ip of the given node."""
+        raise NotImplementedError("Must use internal IPs with slurm")
+
+    def internal_ip(self, node_id: str) -> Optional[str]:
+        """Returns the internal ip (Ray ip) of the given node."""
+        if node_id == HEAD_NODE_ID_OUTSIDE_SLURM:
+            return self.head_ip
+        else:
+            return slurm_get_job_ip(node_id)
+
+    def get_node_id(self, ip_address: str, use_internal_ip: bool = True) -> str:
+        """Returns the node_id given an IP address.
+
+        Assumes ip-address is unique per node. (TODO: why?)
+
+        This function also updates the whole ip_cache if current cache information
+        cannot satisfy the query. The update is done by calling non_terminated_nodes()
+        to get all the nodes, and then get the IP address of each of them. As a result
+        of non_terminated_nodes() call, the node states on file are also updated. 
+
+        Args:
+            ip_address: Address of node.
+            use_internal_ip: Whether the ip address is
+                public or private.
+
+        Raises:
+            ValueError if not found.
+        """
+
+        if not use_internal_ip:
+            raise ValueError("Must use internal IPs with slurm")
+
+        def find_node_id():
+            if use_internal_ip:
+                return self._internal_ip_cache.get(ip_address)
+            else:
+                return self._external_ip_cache.get(ip_address)
+
+        if not find_node_id(): 
+            all_nodes = self.non_terminated_nodes({})
+            ip_func = self.internal_ip if use_internal_ip else self.external_ip
+            ip_cache = (
+                self._internal_ip_cache if use_internal_ip else self._external_ip_cache
+            )
+            for node_id in all_nodes:
+                ip_cache[ip_func(node_id)] = node_id
+
+        if not find_node_id():
+            if use_internal_ip:
+                known_msg = f"Worker internal IPs: {list(self._internal_ip_cache)}"
+            else:
+                known_msg = f"Worker external IP: {list(self._external_ip_cache)}"
+            raise ValueError(f"ip {ip_address} not found. " + known_msg)
+
+        return find_node_id()
+        

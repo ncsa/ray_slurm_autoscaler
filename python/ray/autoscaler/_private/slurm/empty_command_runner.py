@@ -110,6 +110,10 @@ class EmptyCommandRunner(CommandRunnerInterface):
             target: The (remote) destination path.
         """
 
+        if self.under_slurm:
+            if slurm_get_job_status(self.node_id) != SLURM_JOB_RUNNING:
+                raise Exception("Node {} is not ready".format(self.node_id))
+
         cli_logger.warning("The empty rsync up is called: {} to {}\n", source, target)
         os.system("rsync -avz " + source + " " + target)
         return
@@ -125,6 +129,10 @@ class EmptyCommandRunner(CommandRunnerInterface):
             source: The (remote) source directory or file.
             target: The (local) destination path.
         """
+
+        if self.under_slurm:
+            if slurm_get_job_status(self.node_id) != SLURM_JOB_RUNNING:
+                raise Exception("Node {} is not ready".format(self.node_id))
 
         cli_logger.warning("The empty rsync down is called: {} to {}\n", source, target)
         os.system("rsync -avz " + source + " " + target)
