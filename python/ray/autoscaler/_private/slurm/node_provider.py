@@ -147,75 +147,9 @@ class NodeProvider:
     define new implementations of NodeProvider for use with the "external" node
     provider option.
 
-    The APIs are classified into 3 main catagories:
-        1. Cluster config
-            __init__ (constructor)
-            bootstrap_config()
-            fillout_available_node_types_resources()
-            prepare_for_head_node()
-            max_terminate_nodes()
-            is_readonly()
-        2. Node operations (creation, setup, and termination)
-            create_node()
-            create_node_with_resources()
-            get_command_runner()
-            terminate_node()
-            terminate_nodes()
-        3. Node info setting and query
-            non_terminated_nodes()
-            is_running()
-            is_terminated()
-            set_node_tags()
-            node_tags()
-            external_ip()
-            internal_ip()
-            get_node_id()
-    
-    Node information includes node id, node states, and node tags. Additional 
-    information could also be stored for customize platform.
-
-    **Node id**:
-    Node ids should be unqiue for every node.  
-
-    **Node states**:
-    Nodes may be in one of three states: {pending, running, terminated}. 
-        pending: The node has been created, but haven't started the Ray runtime
-        running: The node has active Ray runtime
-        terminated: The node has been terminated
-    The states may be represented in any kind of format internally, as long as 
-    is_running(), is_terminated(), and non_terminate_nodes() reflects them correctly. 
-
-    **Node tag**:
-    Node tags are formatted as Dict[str, str], with key to be tag name and value to be
-    tag value. For example, a node can have tag 
-        {TAG_RAY_NODE_KIND  : NODE_KIND_WORKER, 
-         TAG_RAY_NODE_STATUS: STATUS_UP_TO_DATE}
-    where "TAG_RAY_NODE_KIND" and "TAG_RAY_NODE_STATUS" are the tag names, and 
-    "NODE_KIND_WORKER" and "STATUS_UP_TO_DATE" are the tag values for this node. 
-    If tag-specfic operations are needed, which is not common, see
-    ray.autoscaler.tags for detail tag names and values. 
-
-    Other assumptions made by the autoscaler:
-    #. NodeProviders are namespaced by the `cluster_name` parameter; they only
-    operate on nodes within that namespace.
-    #. The "nodes" are VM-like that could run setup commands remotely (such as via SSH)
-    #. The IP addresses of the nodes are unique
-    #. Nodes should appear immediately once started by `create_node`, and transition
-    immediately to terminated when `terminate_node` is called. This means any APIs,
-    that are affected by the nodes states, especially non_terminate_nodes(), should 
-    reflect the changes immediately. 
-    #. The instance of this class can be constructed and destructed from multiple threads
-    simultaneously. As a result:
-        1. All data operations should be thread-safe
-        2. State information should not be stored as class variables that are lost when 
-            the class instance is destructed
-    
-    A general overview of how autoscaler is connected to node_provider:
-
-    The process for launching a ray node: TODO:
-(1) Calls "create_node". This only allocate some physical resources and doesn't really starts the ray runtime, e.g. K8s just gets a new port
-(2) Uses "command runner" (such as SSH or K8s interface) to run the init commands on the allocated node to start the ray runtime.
-
+    Args:
+        provider_config: The "provider" section of the autoscaler config yaml
+        cluster_name: The "cluster_name" section of the autoscaler config yaml
 
     *** About Slurm node_provider: ***
 
@@ -226,30 +160,27 @@ class NodeProvider:
 
     Design hack:
     The "run setup command after a node is created" doesn't fit the slurm model. 
-
+    As a result, all the setup are done at create_node() (inside the slurm script), 
+    and a empty command runner is used. 
+    For copying (rsync), since all the nodes share a file system, the file mounting is 
+    not needed. The only place needed 
 
     The following things are stored in the temperory folder:
         1. The cluster states storage file
         2. The file lock for cluster states storage file
         3. Modified (from template) Slurm/Bash scripts for launching specific nodes
 
-    Notes on IP: (how they are used)
 
     """
 
     def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
         """Init the node provider class.
 
-        Args:
-            provider_config: The "provider" section of the autoscaler config yaml
-            cluster_name: The "cluster_name" section of the autoscaler config yaml
-
         Three main things are done:
             1. Store the necessary information from provider_config
             2. Create the temperory folder (if not exist) and assign file paths for 
                 cluster states storage and file lock
             3. Re-construct the cluster state information from file, if exist
-
         """
         
         self.provider_config = provider_config
@@ -294,7 +225,6 @@ class NodeProvider:
         
         Args:
             cluster_config: The whole autoscaler config yaml
-
         """
         return cluster_config
 
@@ -306,7 +236,6 @@ class NodeProvider:
         
         Args:
             cluster_config: The whole autoscaler config yaml
-        
         """
         # TODO: Future: overide to prevent user from messing up. Can also fill in default value here
         return cluster_config  
@@ -316,7 +245,6 @@ class NodeProvider:
         
         Args:
             cluster_config: The whole autoscaler config yaml
-        
         """
         return cluster_config
 
@@ -465,15 +393,8 @@ class NodeProvider:
     ) -> Optional[Dict[str, Any]]:
         """Create nodes with a given resource config. 
 
-        This is the method actually called by the autoscaler. Prefer to
-        implement this when possible directly, otherwise it delegates to the
-        create_node() implementation.
-
-        The node type is determined by the autoscaler 
+        Ignore this function for now---simply forward the call to create_node()
         """
-
-        # LTK's note: the resource config for a specific node type is fixed
-        # which will be handled by create_node() using the node_config
 
         return self.create_node(node_config, tags, count)
     
@@ -490,18 +411,18 @@ class NodeProvider:
         """Returns the CommandRunner class used to run commands on specific node.
 
         Args:
-        log_prefix(str): stores "NodeUpdater: {}: ".format(<node_id>). Used
-            to print progress in the CommandRunner.
-        node_id(str): the node ID.
-        auth_config(dict): the authentication configs from the autoscaler
-            yaml file.
-        cluster_name(str): the name of the cluster.
-        process_runner(module): the module to use to run the commands
-            in the CommandRunner. E.g., subprocess.
-        use_internal_ip(bool): whether the node_id belongs to an internal ip
-            or external ip.
-        docker_config(dict): If set, the docker information of the docker
-            container that commands should be run on.
+            log_prefix(str): stores "NodeUpdater: {}: ".format(<node_id>). Used
+                to print progress in the CommandRunner.
+            node_id(str): the node ID.
+            auth_config(dict): the authentication configs from the autoscaler
+                yaml file.
+            cluster_name(str): the name of the cluster.
+            process_runner(module): the module to use to run the commands
+                in the CommandRunner. E.g., subprocess.
+            use_internal_ip(bool): whether the node_id belongs to an internal ip
+                or external ip.
+            docker_config(dict): If set, the docker information of the docker
+                container that commands should be run on.
         """
         common_args = {
             "log_prefix": log_prefix,
@@ -571,10 +492,6 @@ class NodeProvider:
 
         The node states on file will be updated by checking the slurm job status.
         Other node information on file remains unchanged
-
-        Args:
-            tag_filers: key: the tag name; value: the expected tag value
-
         """
         
         workers = self.state.get()
@@ -621,12 +538,7 @@ class NodeProvider:
             return slurm_get_job_status(node_id) == SLURM_JOB_NOT_EXIST
     
     def set_node_tags(self, node_id: str, tags: Dict[str, str]) -> None:
-        """Sets the tag values (string dict) for the specified node.
-        
-            Args:
-                node_id: the node id
-                tags: key: the tag name; value: the tag value
-        """
+        """Sets the tag values (string dict) for the specified node."""
         with self.state.file_lock:
             workers = self.state.get()
             if node_id in workers:
@@ -648,7 +560,7 @@ class NodeProvider:
             return {}
 
     def external_ip(self, node_id: str) -> Optional[str]:
-        """Returns the external ip of the given node."""
+        """Returns the external ip of the given node.TODO:"""
         raise NotImplementedError("Must use internal IPs with slurm")
 
     def internal_ip(self, node_id: str) -> Optional[str]:
@@ -661,7 +573,7 @@ class NodeProvider:
     def get_node_id(self, ip_address: str, use_internal_ip: bool = True) -> str:
         """Returns the node_id given an IP address.
 
-        Assumes ip-address is unique per node. (TODO: why?)
+        Assumes ip-address is unique per node.
 
         This function also updates the whole ip_cache if current cache information
         cannot satisfy the query. The update is done by calling non_terminated_nodes()
